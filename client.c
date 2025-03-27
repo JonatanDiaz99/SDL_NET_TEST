@@ -91,30 +91,38 @@ int main(int argc, char *argv[]) {
         playerPosX[i] = 0;
         playerPosY[i] = 0;
     }
-
+    bool keys[SDL_NUM_SCANCODES] ={0};
     bool running = true;
     while (running) {
         // Handle input
-        SDL_Event e;
+        SDL_Event event;
         int dx = 0, dy = 0;
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) {
-                running = false;
-            }
-            else if (e.type == SDL_KEYDOWN) {
-                switch (e.key.keysym.sym) {
-                    case SDLK_UP:    dy = -5; break;
-                    case SDLK_DOWN:  dy =  5; break;
-                    case SDLK_LEFT:  dx = -5; break;
-                    case SDLK_RIGHT: dx =  5; break;
-                    case SDLK_ESCAPE:
-                        running = false;
-                        break;
-                    default: break;
-                }
-            }
+    while (SDL_PollEvent(&event)){
+        switch (event.type){
+        case SDL_QUIT:
+            running = false;
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            keys[event.button.button] = SDL_PRESSED;
+            break;
+        case SDL_MOUSEBUTTONUP:
+            keys[event.button.button] = SDL_RELEASED;
+            break;
+        case SDL_KEYDOWN:
+            keys[event.key.keysym.scancode]  = true;
+            break;
+        case SDL_KEYUP:
+            keys[event.key.keysym.scancode]  = false;
+            break;
+        default:
+            break;
         }
-
+    }
+        if(keys[SDL_SCANCODE_UP]) dy = -5;
+        if(keys[SDL_SCANCODE_DOWN]) dy = 5;
+        if(keys[SDL_SCANCODE_LEFT]) dx = -5;
+        if(keys[SDL_SCANCODE_RIGHT]) dx = 5;
+        // dy(-up/ner), dx(-left/rhift) 
         // If there was a movement, send it
         if (dx != 0 || dy != 0) {
             PacketData pkg;
