@@ -1,149 +1,189 @@
+/* ========== server.c ========== */
 #include <stdio.h>
-#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <SDL.h>
 #include <SDL_net.h>
 
-#define PORT 1234
-#define MAX_PLAYERS 2
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 600
+#include "shared.h"
 
+// Each player data: position on screen
 typedef struct {
-    int id;   // Player ID
     int x;
     int y;
-} Player;
+} PlayerState;
 
-Player players[MAX_PLAYERS];
-int connectedPlayers = 0;
+static PlayerState players[MAX_PLAYERS];
+static IPaddress clients[MAX_PLAYERS];
+static int connectedPlayers = 0;
 
-// Store the IP/port of each connected client
-IPaddress clientAddrs[MAX_PLAYERS];
-UDPsocket serverSocket = NULL;
-UDPpacket *recvPacket = NULL;
-UDPpacket *sendPacket = NULL;
-
-// Attempt to find which player (if any) is associated with this address
-int getPlayerIDByAddress(IPaddress addr) {
+// Helper: find which player ID corresponds to an IP/port
+// Return -1 if not found
+int findClient(IPaddress addr) {
     for (int i = 0; i < connectedPlayers; i++) {
-        if (clientAddrs[i].host == addr.host && clientAddrs[i].port == addr.port) {
-            return i;  // Found existing player
+        if (clients[i].host == addr.host && clients[i].port == addr.port) {
+            return i;
         }
     }
-    return -1; // Unknown address
+    return -1;
 }
 
-// Broadcast the entire players[] array to all connected clients
-void sendPlayerPositions() {
-    if (!sendPacket) return;
+// Remove client by index
+void removeClient(int index) {
+    printf("Removing client at index %d\n", index);
+    // Shift everything down from the end
+    for (int i = index; i < connectedPlayers - 1; i++) {
+        clients[i] = clients[i + 1];
+        players[i] = players[i + 1]; // Also shift position
+    }
+    connectedPlayers--;
+}
 
-    // Copy the entire array of Player structs into the packet
-    memcpy(sendPacket->data, players, sizeof(players));
-    sendPacket->len = sizeof(players);
+// Broadcast all players' positions to each client
+void broadcastPlayers(UDPsocket sock, UDPpacket *packet) {
+    // We’ll send the entire players[] array in one go
+    // or we can send multiple messages, but let's do one shot.
+    // We'll just do: 2 * int for each player: x, y
+    // But let's do it very simply with a second buffer or struct.
 
-    // Send to each connected player
+    // We'll create a temporary buffer: each player is 2 ints => 8 bytes
+    // With MAX_PLAYERS players, that's 8 * MAX_PLAYERS = 32 for 4 players,
+    // but let's be safe and assume 8 * 16 or just 128.
+    // For clarity, let's do a small known limit.
+    char buffer[512];
+    int offset = 0;
+
+    // Copy connectedPlayers (so client knows how many are valid)
+    memcpy(buffer + offset, &connectedPlayers, sizeof(int));
+    offset += sizeof(int);
+
+    // Now copy positions for each player slot in the first connectedPlayers
     for (int i = 0; i < connectedPlayers; i++) {
-        sendPacket->address = clientAddrs[i];
-        SDLNet_UDP_Send(serverSocket, -1, sendPacket);
+        memcpy(buffer + offset, &players[i].x, sizeof(int));
+        offset += sizeof(int);
+        memcpy(buffer + offset, &players[i].y, sizeof(int));
+        offset += sizeof(int);
+    }
+
+    // Put this in the outgoing packet
+    memcpy(packet->data, buffer, offset);
+    packet->len = offset;
+
+    // Send to each connected client
+    for (int i = 0; i < connectedPlayers; i++) {
+        packet->address = clients[i];
+        SDLNet_UDP_Send(sock, -1, packet);
     }
 }
 
-int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv; // Silence unused warnings if you like
+
     if (SDL_Init(0) < 0) {
         printf("SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-
     if (SDLNet_Init() < 0) {
         printf("SDLNet_Init failed: %s\n", SDLNet_GetError());
         SDL_Quit();
         return 1;
     }
 
-    // Open a UDP socket on the specified port
-    serverSocket = SDLNet_UDP_Open(PORT);
+    // Open server UDP socket
+    UDPsocket serverSocket = SDLNet_UDP_Open(PORT);
     if (!serverSocket) {
-        printf("Failed to open UDP socket on port %d: %s\n", PORT, SDLNet_GetError());
+        printf("Failed to open UDP socket on port %d\n", PORT);
         SDLNet_Quit();
         SDL_Quit();
         return 1;
     }
 
-    // Allocate packets for receiving and sending data
-    recvPacket = SDLNet_AllocPacket(512);
-    sendPacket = SDLNet_AllocPacket(512);
+    // Packets for sending/receiving
+    UDPpacket *recvPacket = SDLNet_AllocPacket(512);
+    UDPpacket *sendPacket = SDLNet_AllocPacket(512);
     if (!recvPacket || !sendPacket) {
-        printf("Failed to allocate UDP packets.\n");
+        printf("Failed to allocate packets\n");
+        SDLNet_UDP_Close(serverSocket);
         SDLNet_Quit();
         SDL_Quit();
         return 1;
     }
 
-    // Initialize player data (positions, IDs)
-    players[0].id = 0;  players[0].x = 100;  players[0].y = 250;
-    players[1].id = 1;  players[1].x = 200;  players[1].y = 250;
+    // Initialize player positions
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        players[i].x = 100 + i * 50;
+        players[i].y = 100 + i * 50;
+    }
 
-    connectedPlayers = 0; // No one connected yet
+    printf("UDP server started on port %d\n", PORT);
 
-    printf("UDP Server is running on port %d...\n", PORT);
-
-    // Main server loop
-    while (1) {
-        // Check if a packet has arrived
+    bool running = true;
+    while (running) {
+        // Check for packets
         while (SDLNet_UDP_Recv(serverSocket, recvPacket)) {
-            // Figure out who sent this packet
-            IPaddress sender = recvPacket->address;
-            int senderID = getPlayerIDByAddress(sender);
+            // We expect a PacketData or a smaller/larger message
+            if (recvPacket->len == sizeof(PacketData)) {
+                PacketData pkg;
+                memcpy(&pkg, recvPacket->data, sizeof(PacketData));
 
-            // If we don't know this sender yet, try to add them
-            if (senderID < 0 && connectedPlayers < MAX_PLAYERS) {
-                senderID = connectedPlayers;
-                clientAddrs[senderID] = sender;
-                connectedPlayers++;
+                // Find or add the sender
+                IPaddress sender = recvPacket->address;
+                int playerIndex = findClient(sender);
 
-                printf("New player connected with ID %d (host=%u, port=%u)\n",
-                       senderID, sender.host, sender.port);
-            }
+                // If unknown, add if we have capacity
+                if (playerIndex == -1 && connectedPlayers < MAX_PLAYERS) {
+                    playerIndex = connectedPlayers;
+                    clients[playerIndex] = sender;
+                    connectedPlayers++;
+                    printf("New client added as player %d\n", playerIndex);
+                }
 
-            // If we have a valid senderID, parse the incoming data
-            if (senderID >= 0 && senderID < MAX_PLAYERS) {
-                if (recvPacket->len >= 2 * (Uint16)sizeof(int)) {
-                    // Interpret the received data as two ints: dx, dy
-                    int dx, dy;
-                    memcpy(&dx, recvPacket->data, sizeof(int));
-                    memcpy(&dy, (char*)recvPacket->data + sizeof(int), sizeof(int));
+                if (playerIndex >= 0) {
+                    // Process the incoming message
+                    if (pkg.messageType == MSG_MOVE) {
+                        // Adjust that player's position
+                        players[playerIndex].x += pkg.dx;
+                        players[playerIndex].y += pkg.dy;
 
-                    // Update that player's position
-                    players[senderID].x += dx;
-                    players[senderID].y += dy;
-                    
-                    // Simple boundary check (optional)
-                    if (players[senderID].x < 0) players[senderID].x = 0;
-                    if (players[senderID].x > SCREEN_WIDTH) players[senderID].x = SCREEN_WIDTH;
-                    if (players[senderID].y < 0) players[senderID].y = 0;
-                    if (players[senderID].y > SCREEN_HEIGHT) players[senderID].y = SCREEN_HEIGHT;
+                        // Just clamp to screen boundaries
+                        if (players[playerIndex].x < 0) players[playerIndex].x = 0;
+                        if (players[playerIndex].x > SCREEN_WIDTH) players[playerIndex].x = SCREEN_WIDTH;
+                        if (players[playerIndex].y < 0) players[playerIndex].y = 0;
+                        if (players[playerIndex].y > SCREEN_HEIGHT) players[playerIndex].y = SCREEN_HEIGHT;
+                    }
+                    else if (pkg.messageType == MSG_DISCONNECT) {
+                        // This client is disconnecting
+                        printf("Player %d disconnected.\n", playerIndex);
+                        removeClient(playerIndex);
+
+                        if (connectedPlayers == 0) {
+                            printf("All clients disconnected. Shutting down server.\n");
+                            running = false;
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        // Broadcast updated positions to all players
+        // Broadcast updated positions to all clients
         if (connectedPlayers > 0) {
-            sendPlayerPositions();
+            broadcastPlayers(serverSocket, sendPacket);
         }
 
-        // Limit loop frequency (~60 FPS)
+        // Minimal delay
         SDL_Delay(16);
+
+        if (!running && connectedPlayers == 0) {
+            // break out of outer loop
+            break;
+        }
     }
 
-    // Cleanup (technically never reached in this code)
     SDLNet_FreePacket(recvPacket);
     SDLNet_FreePacket(sendPacket);
     SDLNet_UDP_Close(serverSocket);
-
     SDLNet_Quit();
     SDL_Quit();
     return 0;

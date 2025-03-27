@@ -1,25 +1,20 @@
+/* ========== client.c ========== */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <SDL.h>
 #include <SDL_net.h>
 
-#define PORT 1234
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 600
-#define RECT_SIZE 50
+#include "shared.h"
 
-// Same Player struct as on the server
-typedef struct {
-    int id;
-    int x;
-    int y;
-} Player;
+static UDPsocket udpSocket = NULL;
+static UDPpacket *outPacket = NULL;
+static UDPpacket *inPacket = NULL;
 
-int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    // Initialize SDL and SDL_net
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         printf("SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -30,8 +25,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Create an SDL window and renderer
-    SDL_Window* window = SDL_CreateWindow("UDP Client Example",
+    // Create a window
+    SDL_Window *window = SDL_CreateWindow("UDP Client",
                                           SDL_WINDOWPOS_CENTERED,
                                           SDL_WINDOWPOS_CENTERED,
                                           SCREEN_WIDTH, SCREEN_HEIGHT,
@@ -42,7 +37,7 @@ int main(int argc, char** argv) {
         SDL_Quit();
         return 1;
     }
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) {
         printf("Failed to create renderer: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
@@ -51,10 +46,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ------------------------------------------------------
-    // UDP Socket Setup
-    // ------------------------------------------------------
-    // Resolve the server address (change IP to match your server if not on localhost)
+    // Resolve the server address (change IP if needed)
     IPaddress serverAddr;
     if (SDLNet_ResolveHost(&serverAddr, "127.0.0.1", PORT) < 0) {
         printf("SDLNet_ResolveHost failed: %s\n", SDLNet_GetError());
@@ -65,8 +57,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Open a UDP socket on any free local port
-    UDPsocket udpSocket = SDLNet_UDP_Open(0);
+    // Open a local UDP port (0 picks any available)
+    udpSocket = SDLNet_UDP_Open(0);
     if (!udpSocket) {
         printf("SDLNet_UDP_Open failed: %s\n", SDLNet_GetError());
         SDL_DestroyRenderer(renderer);
@@ -76,13 +68,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Allocate packets for sending/receiving
-    UDPpacket* outPacket = SDLNet_AllocPacket(512);
-    UDPpacket* inPacket  = SDLNet_AllocPacket(512);
+    // Allocate packets
+    outPacket = SDLNet_AllocPacket(512);
+    inPacket  = SDLNet_AllocPacket(512);
     if (!outPacket || !inPacket) {
-        printf("Failed to allocate UDP packets.\n");
+        printf("Failed to allocate packets.\n");
         if (outPacket) SDLNet_FreePacket(outPacket);
-        if (inPacket)  SDLNet_FreePacket(inPacket);
+        if (inPacket) SDLNet_FreePacket(inPacket);
         SDLNet_UDP_Close(udpSocket);
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
@@ -91,77 +83,110 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Array to store positions of up to 2 players
-    Player players[2];
-    memset(players, 0, sizeof(players));
+    // We'll store up to MAX_PLAYERS positions
+    int numPlayers = 0; 
+    int playerPosX[MAX_PLAYERS];
+    int playerPosY[MAX_PLAYERS];
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        playerPosX[i] = 0;
+        playerPosY[i] = 0;
+    }
 
-    printf("UDP Client started. Sending data to server...\n");
-
-    // Main loop
-    int running = 1;
+    bool running = true;
     while (running) {
         // Handle input
-        SDL_Event event;
+        SDL_Event e;
         int dx = 0, dy = 0;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = 0;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                running = false;
             }
-            else if (event.type == SDL_KEYDOWN) {
-                switch (event.key.keysym.sym) {
+            else if (e.type == SDL_KEYDOWN) {
+                switch (e.key.keysym.sym) {
                     case SDLK_UP:    dy = -5; break;
                     case SDLK_DOWN:  dy =  5; break;
                     case SDLK_LEFT:  dx = -5; break;
                     case SDLK_RIGHT: dx =  5; break;
+                    case SDLK_ESCAPE:
+                        running = false;
+                        break;
                     default: break;
                 }
             }
         }
 
-        // ------------------------------------------------------
-        // Send (dx, dy) to the server
-        // ------------------------------------------------------
-        // Put dx, dy in the outgoing packet
-        memcpy(outPacket->data, &dx, sizeof(int));
-        memcpy(outPacket->data + sizeof(int), &dy, sizeof(int));
-        outPacket->len = 2 * sizeof(int);
-        outPacket->address = serverAddr;
+        // If there was a movement, send it
+        if (dx != 0 || dy != 0) {
+            PacketData pkg;
+            pkg.messageType = MSG_MOVE;
+            pkg.playerID = 0; // Example: no real ID system on client side
+            pkg.dx = dx;
+            pkg.dy = dy;
+            pkg.health = 100; // arbitrary
 
-        // Actually send the packet
-        SDLNet_UDP_Send(udpSocket, -1, outPacket);
-
-        // ------------------------------------------------------
-        // Attempt to receive updated player positions from the server
-        // ------------------------------------------------------
-        while (SDLNet_UDP_Recv(udpSocket, inPacket)) {
-            // inPacket->data should contain the array of Player structs
-            if (inPacket->len == sizeof(players)) {
-                memcpy(players, inPacket->data, sizeof(players));
-            }
-            // If your server sends different-sized packets or multiple packet types,
-            // you may need logic to distinguish them here.
+            memcpy(outPacket->data, &pkg, sizeof(PacketData));
+            outPacket->len = sizeof(PacketData);
+            outPacket->address = serverAddr;
+            SDLNet_UDP_Send(udpSocket, -1, outPacket);
         }
 
-        // ------------------------------------------------------
-        // Render the scene
-        // ------------------------------------------------------
+        // Receive updated positions from server
+        while (SDLNet_UDP_Recv(udpSocket, inPacket)) {
+            // We’re sending an int for connectedPlayers, then x,y for each
+            // So total length = sizeof(int) + 2*sizeof(int)*connectedPlayers
+            // We can parse it accordingly
+            char *buf = (char *)inPacket->data;
+            int offset = 0;
+            // Check we at least have an int
+            if (inPacket->len >= (int)sizeof(int)) {
+                memcpy(&numPlayers, buf + offset, sizeof(int));
+                offset += sizeof(int);
+
+                // For each player
+                for (int i = 0; i < numPlayers; i++) {
+                    if (offset + 2 * (int)sizeof(int) <= inPacket->len) {
+                        memcpy(&playerPosX[i], buf + offset, sizeof(int));
+                        offset += sizeof(int);
+                        memcpy(&playerPosY[i], buf + offset, sizeof(int));
+                        offset += sizeof(int);
+                    }
+                }
+            }
+        }
+
+        // Render
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
 
-        // Draw player 0 in red
-        SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
-        SDL_Rect rect1 = { players[0].x, players[0].y, RECT_SIZE, RECT_SIZE };
-        SDL_RenderFillRect(renderer, &rect1);
-
-        // Draw player 1 in blue
-        SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
-        SDL_Rect rect2 = { players[1].x, players[1].y, RECT_SIZE, RECT_SIZE };
-        SDL_RenderFillRect(renderer, &rect2);
+        // Draw each player
+        for (int i = 0; i < numPlayers; i++) {
+            // Just alternate color for fun
+            if (i % 2 == 0) {
+                SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
+            } else {
+                SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
+            }
+            SDL_Rect rect = { playerPosX[i], playerPosY[i], RECT_SIZE, RECT_SIZE };
+            SDL_RenderFillRect(renderer, &rect);
+        }
 
         SDL_RenderPresent(renderer);
-
-        // Limit CPU usage (~60 FPS)
         SDL_Delay(16);
+    }
+
+    // If we’re disconnecting, let server know
+    {
+        PacketData pkg;
+        pkg.messageType = MSG_DISCONNECT;
+        pkg.playerID = 0;
+        pkg.dx = 0;
+        pkg.dy = 0;
+        pkg.health = 0;
+
+        memcpy(outPacket->data, &pkg, sizeof(PacketData));
+        outPacket->len = sizeof(PacketData);
+        outPacket->address = serverAddr;
+        SDLNet_UDP_Send(udpSocket, -1, outPacket);
     }
 
     // Cleanup
